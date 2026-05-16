@@ -13,30 +13,29 @@
 #include <ArduinoJson.h>
 #include <Wire.h>
 #include <WiFiClientSecure.h>
+#include <ESP32PWM.h> // <-- Use this instead!// Sometimes required by ESP32Servo for timer management
 
-// INA226 I2C address (default is 0x40)
 #define INA226_ADDRESS 0x40
-
-// INA226 Register addresses
 #define INA226_REG_CONFIG 0x00
 #define INA226_REG_SHUNT_VOLTAGE 0x01
 #define INA226_REG_BUS_VOLTAGE 0x02
 #define INA226_REG_POWER 0x03
 #define INA226_REG_CURRENT 0x04
 #define INA226_REG_CALIBRATION 0x05
-#define CURRENT_LSB 0.00005
-#define CALIBRATION 51200
+
+#define CALIBRATION 512
+
+#define JSON_DOC_SIZE 1024
 
 // Configuration values
-#define INA226_CONFIG_DEFAULT 0x4127
-#define SHUNT_RESISTANCE 0.002
-#define MAX_CURRENT 0.5
+#define INA226_CONFIG_DEFAULT 0x4527
+#define SHUNT_RESISTANCE 0.002  // Your module's built-in shunt
+#define MAX_CURRENT 3.2768
 
 // Electronic Load Configuration
 #define PWM_PIN 25              // GPIO pin for MOSFET control
 #define PWM_FREQ 25000          // 25kHz PWM frequency
 #define PWM_RESOLUTION 8        // 8-bit resolution (0-255)
-
 
 // BLE UUIDs
 #define SERVICE_UUID        "91bad492-b950-4226-aa2b-4ede9fa42f59"
@@ -88,7 +87,25 @@ const float DEVICE_LNG = -90.241234;
 
 // Upload Timer (e.g., 5 minutes = 300000 ms)
 unsigned long lastUploadTime = 0;
-const unsigned long UPLOAD_INTERVAL = 100000;
+const unsigned long UPLOAD_INTERVAL = 300000;
+
+// --- Sun Tracking Memory ---
+int sunriseMinutes = 360;  // Defaults to 6:00 AM (6 * 60)
+int sunsetMinutes = 1080;  // Defaults to 6:00 PM (18 * 60)
+bool hasRealSunData = false;
+
+// Helper function to convert "6:32:14 AM" into total minutes from midnight
+int timeStringToMinutes(String timeStr) {
+  int h, m, s;
+  char ampm[3];
+  // Parse the string into hours, minutes, seconds, and AM/PM
+  sscanf(timeStr.c_str(), "%d:%d:%d %2s", &h, &m, &s, ampm);
+  
+  if (strcmp(ampm, "PM") == 0 && h != 12) h += 12; // Convert PM to 24-hour time
+  if (strcmp(ampm, "AM") == 0 && h == 12) h = 0;   // Handle midnight
+  
+  return (h * 60) + m;
+}
 
 class WiFiCredsCallback : public BLECharacteristicCallbacks {
   void onWrite(BLECharacteristic *pCharacteristic) override {
@@ -193,60 +210,237 @@ void uploadToPipedream() {
 
   Serial.println("Preparing data upload...");
 
-  // 1. Get formatted time
+  // ── 1. TIME ─────────────────────────────────────────────────
   timeClient.update();
-  unsigned long epochTime = timeClient.getEpochTime();
-  struct tm *ptm = gmtime((time_t *)&epochTime);
-  char timeString[25];
-  sprintf(timeString, "%04d-%02d-%02dT%02d:%02d:%02dZ", 
-          ptm->tm_year + 1900, ptm->tm_mon + 1, ptm->tm_mday, 
-          ptm->tm_hour, ptm->tm_min, ptm->tm_sec);
+  unsigned long rawTime = timeClient.getEpochTime();
+  time_t now = (time_t)rawTime;
+  struct tm* ptm = gmtime(&now);
 
-  // 2. Create the JSON Document
-  // We use a larger buffer to hold all the data
-  StaticJsonDocument<512> doc;
+  char timeString[25];
+  if (ptm == NULL || rawTime < 100000) {
+    strcpy(timeString, "1970-01-01T00:00:00");
+  } else {
+    sprintf(timeString, "%04d-%02d-%02dT%02d:%02d:%02d",
+            ptm->tm_year + 1900, ptm->tm_mon + 1, ptm->tm_mday,
+            ptm->tm_hour, ptm->tm_min, ptm->tm_sec);
+  }
+
+  // ── 2. WEATHER  (Open-Meteo, no API key) ────────────────────
+  // Mirrors the python fetch_weather() fields exactly
+  float wx_temp        = NAN,  wx_apparent   = NAN;
+  int   wx_humidity    = -1,   wx_cloud      = -1,  wx_code = -1;
+  float wx_wind_speed  = NAN;
+  int   wx_wind_dir    = -1;
+  bool  weatherOk      = false;
+
+  {
+    char wxUrl[256];
+    snprintf(wxUrl, sizeof(wxUrl),
+      "https://api.open-meteo.com/v1/forecast"
+      "?latitude=%.4f&longitude=%.4f"
+      "&current=temperature_2m,relative_humidity_2m,apparent_temperature,"
+      "weather_code,cloud_cover,wind_speed_10m,wind_direction_10m"
+      "&wind_speed_unit=ms&timezone=UTC",
+      DEVICE_LAT, DEVICE_LNG);
+
+    String wxBody;
+    int wxCode = httpsGet(wxUrl, wxBody);
+
+    if (wxCode == 200) {
+      StaticJsonDocument<512> wxDoc;
+      if (!deserializeJson(wxDoc, wxBody)) {
+        JsonObject cur = wxDoc["current"];
+        wx_temp       = cur["temperature_2m"]       | NAN;
+        wx_apparent   = cur["apparent_temperature"] | NAN;
+        wx_humidity   = cur["relative_humidity_2m"] | -1;
+        wx_cloud      = cur["cloud_cover"]          | -1;
+        wx_wind_speed = cur["wind_speed_10m"]       | NAN;
+        wx_wind_dir   = cur["wind_direction_10m"]   | -1;
+        wx_code       = cur["weather_code"]         | -1;
+        weatherOk = true;
+        Serial.printf("Weather: %.1f°C, %d%% cloud, %d%% humidity\n",
+                      wx_temp, wx_cloud, wx_humidity);
+      }
+    } else {
+      Serial.printf("Weather fetch failed (HTTP %d)\n", wxCode);
+    }
+  }
+
+  // ── 3. SUNRISE / SUNSET  (sunrise-sunset.org) ───────────────
+  // Returns UTC times in ISO-8601 format, e.g. "6:32:14 AM"
+  // Full response also includes solar_noon, day_length, etc.
+  String ss_sunrise    = "unavailable";
+  String ss_sunset     = "unavailable";
+  String ss_solar_noon = "unavailable";
+  String ss_day_length = "unavailable";
+  bool   sunOk         = false;
+
+  {
+    char ssUrl[256]; // Increased buffer size for the longer URL
+    snprintf(ssUrl, sizeof(ssUrl),
+      "https://api.sunrise-sunset.org/json"
+      "?lat=%.4f&lng=%.4f&formatted=0&tzid=America/Chicago",
+      DEVICE_LAT, DEVICE_LNG);
+
+    String ssBody;
+    int ssCode = httpsGet(ssUrl, ssBody);
+
+    if (ssCode == 200) {
+      StaticJsonDocument<512> ssDoc;
+      if (!deserializeJson(ssDoc, ssBody)) {
+        const char* status = ssDoc["status"] | "UNKNOWN";
+        if (strcmp(status, "OK") == 0) {
+          ss_sunrise    = ssDoc["results"]["sunrise"].as<String>();
+          ss_sunset     = ssDoc["results"]["sunset"].as<String>();
+          ss_solar_noon = ssDoc["results"]["solar_noon"].as<String>();
+          ss_day_length = ssDoc["results"]["day_length"].as<String>();
+          sunOk = true;
+          Serial.printf("Sunrise: %s  Sunset: %s\n",
+                        ss_sunrise.c_str(), ss_sunset.c_str());
+        }
+      }
+    } else {
+      Serial.printf("Sunrise-sunset fetch failed (HTTP %d)\n", ssCode);
+    }
+  }
+
+  // ── 4. BUILD JSON PAYLOAD ────────────────────────────────────
+  // Structure mirrors the Python MongoDB document exactly:
+  //   device_id / timestamp / readings / status /
+  //   weather   / solar     / location / metadata
+  StaticJsonDocument<JSON_DOC_SIZE> doc;
 
   doc["device_id"] = "solara_esp32_v1";
   doc["timestamp"] = timeString;
+
+  // readings
+  JsonObject readings = doc.createNestedObject("readings");
+  readings["voltage_v"]              = voltage;
+  readings["current_a"]              = current;
+  readings["power_w"]                = power;
+  readings["energy_wh"]              = energy;
+  readings["pwm_value"]              = currentPWM;
+  readings["mppt_status"]            = mpptEnabled ? "ON" : "OFF";
   
-  // Location Data
+  // ADD THESE TWO LINES FOR YOUR SERVO DATA:
+  readings["servo_mode"]             = currentMode; 
+  readings["servo_degree"]           = currentDegree;
+
+  // status
+  const char* status = "active";
+  if (voltage < 11.0)  status = "low_battery";
+  else if (power > 60) status = "overheating";   // adjust threshold as needed
+  doc["status"] = status;
+
+  // weather  (mirrors Python fetch_weather() return dict)
+  JsonObject weather = doc.createNestedObject("weather");
+  if (weatherOk) {
+    weather["temperature_c"]          = wx_temp;
+    weather["apparent_temperature_c"] = wx_apparent;
+    weather["humidity_pct"]           = wx_humidity;
+    weather["cloud_cover_pct"]        = wx_cloud;
+    weather["wind_speed_ms"]          = wx_wind_speed;
+    weather["wind_direction_deg"]     = wx_wind_dir;
+    weather["weather_code"]           = wx_code;
+  } else {
+    weather["error"] = "fetch_failed";
+  }
+  weather["source"] = "open-meteo.com";
+
+  // solar  (new: sunrise-sunset.org data)
+  JsonObject solar = doc.createNestedObject("solar");
+  if (sunOk) {
+    solar["sunrise"]    = ss_sunrise;
+    solar["sunset"]     = ss_sunset;
+    solar["solar_noon"] = ss_solar_noon;
+    solar["day_length"] = ss_day_length;
+  } else {
+    solar["error"] = "fetch_failed";
+  }
+  solar["source"] = "sunrise-sunset.org";
+
+  // location
   JsonObject location = doc.createNestedObject("location");
-  location["lat"] = DEVICE_LAT;
-  location["lng"] = DEVICE_LNG;
+  location["latitude"]  = DEVICE_LAT;
+  location["longitude"] = DEVICE_LNG;
 
-  // Energy Data (These variables must match your global ones)
-  JsonObject data = doc.createNestedObject("energy_data");
-  data["voltage_V"] = voltage;
-  data["current_A"] = current;
-  data["power_W"] = power;
-  data["energy_Wh"] = energy; // Accumulated energy
-  data["pwm_value"] = currentPWM;
-  data["mppt_status"] = mpptEnabled ? "ON" : "OFF";
+  // metadata
+  JsonObject metadata = doc.createNestedObject("metadata");
+  metadata["firmware_version"] = "1.0.2";
+  metadata["location"]         = "test_bench_01";
 
-  // 3. Convert JSON to String
+  // ── 5. SERIALIZE & POST ──────────────────────────────────────
   String payload;
   serializeJson(doc, payload);
 
-  // 4. Send HTTPS POST to Pipedream
+  Serial.println("Sending payload...");
+  Serial.println(payload);   // remove in production
+
   WiFiClientSecure client;
-  client.setInsecure(); // Skip certificate check (crucial for Pipedream)
-  
+  client.setInsecure();
+
   HTTPClient http;
   http.begin(client, PIPEDREAM_URL);
   http.addHeader("Content-Type", "application/json");
-  
+
   int httpResponseCode = http.POST(payload);
-  
+
   if (httpResponseCode > 0) {
-    Serial.print("Data sent! Response: ");
-    Serial.println(httpResponseCode);
+    Serial.printf("Data sent! HTTP %d\n", httpResponseCode);
   } else {
-    Serial.print("Upload failed. Error: ");
-    Serial.println(http.errorToString(httpResponseCode));
+    Serial.printf("Upload failed: %s\n",
+                  http.errorToString(httpResponseCode).c_str());
   }
-  
+
   http.end();
 }
+
+int httpsGet(const char* url, String& out) {
+  WiFiClientSecure client;
+  client.setInsecure();          // same pattern as your existing POST
+
+  HTTPClient http;
+  http.begin(client, url);
+  int code = http.GET();
+  if (code > 0) out = http.getString();
+  http.end();
+  return code;
+}
+
+// void requestSunInfo() {
+//   if (WiFi.status() != WL_CONNECTED) {
+//     Serial.println("WiFi not connected!");
+//     return;
+//   }
+
+//   WiFiClientSecure client;
+//   client.setInsecure();  // Skip certificate validation (for testing only)
+  
+//   HTTPClient http;
+  
+//   // Use HTTPS URL with WiFiClientSecure
+//   String sunUrl = "https://api.sunrise-sunset.org/json?lat=" + String(DEVICE_LAT, 6) + 
+//                 "&lng=" + String(DEVICE_LNG, 6) + "&date=today&tzid=America/Chicago";
+//   http.begin(client, sunUrl);
+//   http.setTimeout(10000);
+  
+//   Serial.println("Making secure API request...");
+//   int httpResponseCode = http.GET();
+  
+//   Serial.print("HTTPS Response Code: ");
+//   Serial.println(httpResponseCode);
+  
+//   if (httpResponseCode > 0) {
+//     String response = http.getString();
+//     Serial.println("Response:");
+//     Serial.println(response);
+//   } else {
+//     Serial.print("HTTPS request failed with error: ");
+//     Serial.println(httpResponseCode);
+//   }
+
+//   http.end();
+// }
 
 void requestSunInfo() {
   if (WiFi.status() != WL_CONNECTED) {
@@ -255,29 +449,41 @@ void requestSunInfo() {
   }
 
   WiFiClientSecure client;
-  client.setInsecure();  // Skip certificate validation (for testing only)
-  
+  client.setInsecure();  
   HTTPClient http;
   
-  // Use HTTPS URL with WiFiClientSecure
   String sunUrl = "https://api.sunrise-sunset.org/json?lat=" + String(DEVICE_LAT, 6) + 
                 "&lng=" + String(DEVICE_LNG, 6) + "&date=today&tzid=America/Chicago";
+                
   http.begin(client, sunUrl);
   http.setTimeout(10000);
   
-  Serial.println("Making secure API request...");
+  Serial.println("Fetching real sunrise/sunset data...");
   int httpResponseCode = http.GET();
   
-  Serial.print("HTTPS Response Code: ");
-  Serial.println(httpResponseCode);
-  
-  if (httpResponseCode > 0) {
+  if (httpResponseCode == 200) {
     String response = http.getString();
-    Serial.println("Response:");
-    Serial.println(response);
+    
+    // Parse the JSON
+    StaticJsonDocument<1024> doc;
+    DeserializationError error = deserializeJson(doc, response);
+    
+    if (!error && doc["status"] == "OK") {
+      String sunriseStr = doc["results"]["sunrise"].as<String>();
+      String sunsetStr = doc["results"]["sunset"].as<String>();
+      
+      // Convert to minutes and save to global variables
+      sunriseMinutes = timeStringToMinutes(sunriseStr);
+      sunsetMinutes = timeStringToMinutes(sunsetStr);
+      hasRealSunData = true;
+      
+      Serial.printf("✓ Sun Data Updated! Sunrise: %s, Sunset: %s\n", 
+                    sunriseStr.c_str(), sunsetStr.c_str());
+    } else {
+      Serial.println("Failed to parse sun data JSON");
+    }
   } else {
-    Serial.print("HTTPS request failed with error: ");
-    Serial.println(httpResponseCode);
+    Serial.printf("HTTPS request failed. Error: %d\n", httpResponseCode);
   }
 
   http.end();
@@ -314,11 +520,16 @@ void smoothServoSweep(int startAngle, int midAngle, int endAngle, int delayMs = 
     }
 }
 
-
 void startWebServer() {
   timeClient.begin();
-  timeClient.setTimeOffset(-6 * 3600);
+  timeClient.setTimeOffset(-5 * 3600);
   timeClient.update();
+
+  requestSunInfo();
+
+  // Print the formatted time (e.g., "14:49:00")
+  Serial.print("Current Time: ");
+  Serial.println(timeClient.getFormattedTime());
 
   myservo.attach(13);
   myservo.write(90);
@@ -328,11 +539,19 @@ void startWebServer() {
   });
 
   server.on("/energy_data", []() {
+    // Read fresh data
+    readINA226();
+    
+    // Get shunt voltage for debugging
+    int16_t shuntRaw = (int16_t)readRegister(INA226_REG_SHUNT_VOLTAGE);
+    float shuntV = shuntRaw * 2.5 / 1000.0;  // in mV
+    
     String json = "{";
     json += "\"voltage\":" + String(voltage, 3) + ",";
     json += "\"current\":" + String(current, 3) + ",";
     json += "\"power\":" + String(power, 3) + ",";
     json += "\"energy\":" + String(energy, 4) + ",";
+    json += "\"shunt_voltage_mV\":" + String(shuntV, 3) + ",";  // ← NEW
     json += "\"pwm\":" + String(currentPWM) + ",";
     json += "\"pwm_percent\":" + String((currentPWM*100)/255) + ",";
     json += "\"mppt_enabled\":" + String(mpptEnabled ? "true" : "false") + ",";
@@ -413,7 +632,6 @@ void startWebServer() {
     currentDegree = 135;
     myservo.write(135);
     server.send(200, "text/plain", "Servo is 135 degrees");
-    requestSunInfo();
     
   });
 
@@ -440,6 +658,7 @@ void startWebServer() {
       stopSunTracking();
       currentMode = "Manual";
       myservo.write(degree);
+      Serial.println(String(degree));
       currentDegree = degree;
       server.send(200, "text/plain", "Servo set to " + String(degree));
     } else {
@@ -447,8 +666,8 @@ void startWebServer() {
     }
   });
 
-  server.on("/servo/apicall", []() {
-    requestSunInfo();
+  server.on("/apicall", []() {
+    uploadToPipedream();
   });
 
   server.on("/servo/mode", []() {
@@ -483,20 +702,48 @@ void stopSunTracking() {
   sunTrackingTicker.detach(); 
 }
 
+// int calculateSunPosition() {
+//   if (timeClient.update()) {
+//     unsigned long epochTime = timeClient.getEpochTime();
+//     struct tm* timeinfo = localtime((time_t*)&epochTime);
+//     int hour = timeinfo->tm_hour;
+//     int minute = timeinfo->tm_min;
+
+//     const int totalMinutesInDay = 12 * 60;
+//     int currentMinutes = (hour - 6) * 60 + minute;
+//     if (currentMinutes < 0) currentMinutes = 0;
+//     if (currentMinutes > totalMinutesInDay) currentMinutes = totalMinutesInDay;
+
+//     float degreeRange = 150.0 - 30.0;
+//     float position = 30.0 + (degreeRange * currentMinutes) / totalMinutesInDay;
+//     return round(position);
+//   } else {
+//     Serial.println("NTP update failed");
+//     return currentDegree;
+//   }
+// }
+
 int calculateSunPosition() {
   if (timeClient.update()) {
-    unsigned long epochTime = timeClient.getEpochTime();
-    struct tm* timeinfo = localtime((time_t*)&epochTime);
-    int hour = timeinfo->tm_hour;
-    int minute = timeinfo->tm_min;
+    int localHour = timeClient.getHours(); 
+    int localMinute = timeClient.getMinutes();
+    int currentTotalMinutes = (localHour * 60) + localMinute;
 
-    const int totalMinutesInDay = 12 * 60;
-    int currentMinutes = (hour - 6) * 60 + minute;
-    if (currentMinutes < 0) currentMinutes = 0;
-    if (currentMinutes > totalMinutesInDay) currentMinutes = totalMinutesInDay;
+    // --- NIGHT MODE (Before dawn OR after dusk) ---
+    if (currentTotalMinutes < sunriseMinutes || currentTotalMinutes >= sunsetMinutes) {
+      return 90; // Safely park at the closed position
+    }
 
-    float degreeRange = 150.0 - 30.0;
-    float position = 30.0 + (degreeRange * currentMinutes) / totalMinutesInDay;
+    // --- DAYLIGHT MODE (Tracking the sun) ---
+    int currentMinutesOfSunlight = currentTotalMinutes - sunriseMinutes;
+    int totalMinutesInDay = sunsetMinutes - sunriseMinutes;
+
+    float startAngle = 90.0;
+    float endAngle = 130.0;
+    float degreeRange = endAngle - startAngle; 
+    
+    float position = startAngle + (degreeRange * currentMinutesOfSunlight) / totalMinutesInDay;
+    
     return round(position);
   } else {
     Serial.println("NTP update failed");
@@ -506,10 +753,30 @@ int calculateSunPosition() {
 
 void updateSunPosition() {
   if (currentMode == "Sun Tracking") {
-    int position = calculateSunPosition();
-    myservo.write(position);
-    currentDegree = position;
-    Serial.println("Sun position updated: " + String(position));
+    int targetPosition = calculateSunPosition();
+
+    // If the jump is large (e.g., returning to 90 at sunset) -> Move slowly!
+    if (abs(targetPosition - currentDegree) > 2) {
+      Serial.printf("Smoothly transitioning servo from %d to %d...\n", currentDegree, targetPosition);
+      
+      if (currentDegree < targetPosition) {
+        for (int pos = currentDegree; pos <= targetPosition; pos++) {
+          myservo.write(pos);
+          delay(80); // 80ms delay per degree = a gentle, slow sweep
+        }
+      } else {
+        for (int pos = currentDegree; pos >= targetPosition; pos--) {
+          myservo.write(pos);
+          delay(80); // 80ms delay per degree
+        }
+      }
+    } else {
+      // Normal daytime tracking: the jump is only 1 degree, so just move it
+      myservo.write(targetPosition);
+    }
+
+    currentDegree = targetPosition;
+    Serial.println("Sun position updated: " + String(currentDegree));
   }
 }
 
@@ -537,44 +804,17 @@ bool initINA226() {
   Serial.println("\n=== INA226 Initialization ===");
   
   Wire.beginTransmission(INA226_ADDRESS);
-  byte error = Wire.endTransmission();
-  
-  Serial.print("I2C Address 0x");
-  Serial.print(INA226_ADDRESS, HEX);
-  Serial.print(" - ");
-  
-  if (error != 0) {
-    Serial.print("ERROR: ");
-    if (error == 2) Serial.println("NACK on address (device not found)");
-    else if (error == 5) Serial.println("Timeout");
-    else Serial.println("Unknown error");
+  if (Wire.endTransmission() != 0) {
     return false;
   }
-  
-  Serial.println("Device found!");
-  
-  Serial.println("Resetting INA226...");
-  writeRegister(INA226_REG_CONFIG, 0x8000);
-  delay(10);
-  
-  Serial.println("Configuring INA226...");
+
   writeRegister(INA226_REG_CONFIG, INA226_CONFIG_DEFAULT);
-  delay(10);
   
-  Serial.print("Setting calibration to: ");
-  Serial.println(CALIBRATION);
-  writeRegister(INA226_REG_CALIBRATION, CALIBRATION);
-  delay(10);
+  float currentLSB = MAX_CURRENT / 32768.0;
+  uint16_t cal = (uint16_t)(0.00512 / (currentLSB * SHUNT_RESISTANCE));
   
-  uint16_t configRead = readRegister(INA226_REG_CONFIG);
-  Serial.print("Config register readback: 0x");
-  Serial.println(configRead, HEX);
+  writeRegister(INA226_REG_CALIBRATION, cal);
   
-  uint16_t calRead = readRegister(INA226_REG_CALIBRATION);
-  Serial.print("Calibration register readback: 0x");
-  Serial.println(calRead, HEX);
-  
-  Serial.println("=== Initialization Complete ===\n");
   delay(100);
   return true;
 }
@@ -583,66 +823,124 @@ void readINA226() {
   uint16_t busVoltageRaw = readRegister(INA226_REG_BUS_VOLTAGE);
   voltage = (busVoltageRaw * 1.25) / 1000.0;
   
-  int16_t shuntVoltageRaw = (int16_t)readRegister(INA226_REG_SHUNT_VOLTAGE);
-  float shuntVoltage = shuntVoltageRaw * 2.5 / 1000000.0;
-  
   int16_t currentRaw = (int16_t)readRegister(INA226_REG_CURRENT);
-  current = currentRaw * CURRENT_LSB;
+  float currentLSB = MAX_CURRENT / 32768.0;
+  current = currentRaw * currentLSB;
   
   uint16_t powerRaw = readRegister(INA226_REG_POWER);
-  float powerLSB = CURRENT_LSB * 25;
+  float powerLSB = currentLSB * 25;
   power = powerRaw * powerLSB;
   
-  static unsigned long lastDebug = 0;
-  if (millis() - lastDebug > 10000) {
-    // Serial.println("\n--- INA226 Raw Register Values ---");
-    // Serial.print("Bus Voltage Raw: 0x");
-    // Serial.print(busVoltageRaw, HEX);
-    // Serial.print(" (");
-    // Serial.print(busVoltageRaw);
-    // Serial.println(")");
-    
-    // Serial.print("Shunt Voltage Raw: 0x");
-    // Serial.print(shuntVoltageRaw, HEX);
-    // Serial.print(" (");
-    // Serial.print(shuntVoltageRaw);
-    // Serial.print(") = ");
-    // Serial.print(shuntVoltage * 1000000, 2);
-    // Serial.println(" µV");
-    
-    // Serial.print("Current Raw: 0x");
-    // Serial.print(currentRaw, HEX);
-    // Serial.print(" (");
-    // Serial.print(currentRaw);
-    // Serial.println(")");
-    
-    // Serial.print("Power Raw: 0x");
-    // Serial.print(powerRaw, HEX);
-    // Serial.print(" (");
-    // Serial.print(powerRaw);
-    // Serial.println(")");
-    // Serial.println("----------------------------------\n");
-    
-    lastDebug = millis();
+  // // ★ ADD DEBUG OUTPUT - Print every reading
+  // Serial.println("\n--- INA226 Reading ---");
+  // Serial.printf("Bus Voltage:   %.3f V\n", voltage);
+  // Serial.printf("Shunt Voltage: %.1f µV (raw: %d)\n", shuntVoltage * 1e6, shuntVoltageRaw);
+  // Serial.printf("Current:       %.3f A (raw: %d)\n", current, currentRaw);
+  // Serial.printf("Power:         %.3f W\n", power);
+  // Serial.printf("PWM Load:      %d/255 (%d%%)\n", currentPWM, (currentPWM*100)/255);
+  
+  // // ★ DIAGNOSTIC
+  // if (abs(shuntVoltageRaw) < 5) {
+  //   Serial.println("⚠️  WARNING: Shunt voltage near zero!");
+  //   Serial.println("   → No current flowing through shunt");
+  //   Serial.println("   → Check: PWM enabled? Load connected?");
+  // }
+  
+  // if (voltage < 0.5) {
+  //   Serial.println("⚠️  WARNING: Bus voltage very low!");
+  //   Serial.println("   → Check solar panel connection");
+  //   Serial.println("   → Ensure adequate light on panel");
+  // }
+  
+  // Serial.println("----------------------\n");
+}
+
+void testMOSFET() {
+  Serial.println("╔═══════════════════════════════════════╗");
+  Serial.println("║   MOSFET HARDWARE TEST                ║");
+  Serial.println("╚═══════════════════════════════════════╝\n");
+  
+  // Test 1: OFF
+  Serial.println("[1/4] MOSFET OFF (PWM = 0)");
+  ledcWrite(PWM_PIN, 0);
+  delay(1000);
+  readINA226();
+  Serial.printf("  Current: %.3f A (%.1f mA)\n", current, current * 1000);
+  Serial.println("  Expected: ~0 mA\n");
+  delay(2000);
+  
+  // Test 2: 25%
+  Serial.println("[2/4] MOSFET 25% (PWM = 64)");
+  ledcWrite(PWM_PIN, 64);
+  delay(1000);
+  readINA226();
+  Serial.printf("  Current: %.3f A (%.1f mA)\n", current, current * 1000);
+  Serial.println("  Expected: Low current\n");
+  delay(2000);
+  
+  // Test 3: 50%
+  Serial.println("[3/4] MOSFET 50% (PWM = 128)");
+  ledcWrite(PWM_PIN, 128);
+  delay(1000);
+  readINA226();
+  Serial.printf("  Current: %.3f A (%.1f mA)\n", current, current * 1000);
+  Serial.println("  Expected: Medium current\n");
+  delay(2000);
+  
+  // Test 4: 100%
+  Serial.println("[4/4] MOSFET 100% (PWM = 255)");
+  ledcWrite(PWM_PIN, 255);
+  delay(1000);
+  readINA226();
+  Serial.printf("  Current: %.3f A (%.1f mA)\n", current, current * 1000);
+  Serial.println("  Expected: Maximum current");
+  
+  if (current > 0.1) {
+    Serial.println("\n✓ MOSFET is conducting!");
+    Serial.println("  Expected: I = V / R_load");
+    Serial.printf("  With 1Ω: I = %.2fV / 1Ω = %.2fA\n", voltage, voltage / 1.0);
+  } else {
+    Serial.println("\n⚠️  WARNING: Very low current!");
+    Serial.println("  Check:");
+    Serial.println("  - MOSFET gate connected to GPIO 25?");
+    Serial.println("  - MOSFET source connected to GND?");
+    Serial.println("  - 1Ω resistor connected from C- to MOSFET drain?");
   }
+  
+  Serial.println("\n╚═══════════════════════════════════════╝\n");
+  
+  // Return to safe state
+  ledcWrite(PWM_PIN, 50);
+  currentPWM = 50;
+  delay(1000);
 }
 
 void calculateEnergy() {
-  static unsigned long previousMicros = 0;
-  unsigned long currentMicros = micros();
+  // static unsigned long previousMicros = 0;
+  // unsigned long currentMicros = micros();
   
-  if (previousMicros == 0) {
-    previousMicros = currentMicros;
-    return;
-  }
+  // if (previousMicros == 0) {
+  //   previousMicros = currentMicros;
+  //   return;
+  // }
   
-  float timeHours = (currentMicros - previousMicros) / 3600000000.0;
+  // float timeHours = (currentMicros - previousMicros) / 3600000000.0;
   
-  if (power > 0) {
+  // if (power > 0) {
+  //   energy += power * timeHours;
+  // }
+  
+  // previousMicros = currentMicros;
+
+  static unsigned long previousTime = 0;
+  unsigned long currentTime = millis();
+  
+  if (previousTime > 0) {
+    float timeHours = (currentTime - previousTime) / 3600000.0;
     energy += power * timeHours;
   }
   
-  previousMicros = currentMicros;
+  previousTime = currentTime;
 }
 
 void printMeasurements() {
@@ -758,9 +1056,9 @@ uint16_t readRegister(uint8_t reg) {
 }
 
 void performMPPTSweep() {
-  Serial.println("\n╔════════════════════════════════════════╗");
-  Serial.println("║   MPPT SWEEP - FINDING OPTIMAL LOAD   ║");
-  Serial.println("╚════════════════════════════════════════╝\n");
+  Serial.println("\n╔═══════════════════════════════════════╗");
+  Serial.println("║   MPPT SWEEP - FINDING MAXIMUM POWER  ║");
+  Serial.println("╚═══════════════════════════════════════╝\n");
   
   maxPower = 0;
   maxPowerVoltage = 0;
@@ -768,90 +1066,64 @@ void performMPPTSweep() {
   optimalPWM = 0;
   
   Serial.println("Sweeping PWM from 0% to 100%...\n");
+  Serial.println("PWM   Duty%   Voltage    Current    Power");
+  Serial.println("----  -----   -------    -------    -----");
   
-  for (int pwm = 0; pwm <= 255; pwm += 13) {
+  for (int pwm = 0; pwm <= 255; pwm += 10) {
     ledcWrite(PWM_PIN, pwm);
-    delay(300);
+    delay(200);
     
     readINA226();
     
-    Serial.print("PWM: ");
-    Serial.print(pwm);
-    Serial.print(" (");
-    Serial.print((pwm * 100) / 255);
-    Serial.print("%)");
-    Serial.print(" → V: ");
-    Serial.print(voltage, 3);
-    Serial.print("V, I: ");
-    Serial.print(current, 3);
-    Serial.print("A, P: ");
-    Serial.print(power, 3);
-    Serial.print("W");
+    Serial.printf("%3d   %3d%%    %6.3fV    %6.3fA    %6.3fW", 
+                  pwm, (pwm * 100) / 255, voltage, current, power);
     
     if (power > maxPower) {
       maxPower = power;
       maxPowerVoltage = voltage;
       maxPowerCurrent = current;
       optimalPWM = pwm;
-      Serial.print(" ← ★ NEW MAXIMUM!");
+      Serial.print(" ← ★ MAX");
     }
     Serial.println();
   }
   
+  // Set to optimal PWM
   currentPWM = optimalPWM;
   ledcWrite(PWM_PIN, currentPWM);
   
-  Serial.println("\n╔════════════════════════════════════════╗");
-  Serial.println("║           MPPT RESULTS                 ║");
-  Serial.println("╠════════════════════════════════════════╣");
-  Serial.print("║ Optimal PWM:    ");
-  Serial.print(optimalPWM);
-  Serial.print(" (");
-  Serial.print((optimalPWM * 100) / 255);
-  Serial.println("%)");
-  Serial.print("║ Max Power:      ");
-  Serial.print(maxPower, 3);
-  Serial.println(" W");
-  Serial.print("║ At Voltage:     ");
-  Serial.print(maxPowerVoltage, 3);
-  Serial.println(" V");
-  Serial.print("║ At Current:     ");
-  Serial.print(maxPowerCurrent, 3);
-  Serial.println(" A");
-  
-  if (maxPowerCurrent > 0.001) {
-    float equivalentR = maxPowerVoltage / maxPowerCurrent;
-    Serial.print("║ Equiv. Load:    ");
-    Serial.print(equivalentR, 1);
-    Serial.println(" Ω");
-  }
-  Serial.println("╚════════════════════════════════════════╝\n");
-  
-  Serial.println("Load automatically set to optimal PWM.");
-  Serial.println("Use /mppt_enable to track changes automatically.\n");
+  Serial.println("\n╔═══════════════════════════════════════╗");
+  Serial.println("║   MPPT RESULTS                        ║");
+  Serial.println("╠═══════════════════════════════════════╣");
+  Serial.printf("║ Optimal PWM:  %3d (%3d%%)              ║\n", 
+                optimalPWM, (optimalPWM * 100) / 255);
+  Serial.printf("║ Max Power:    %.3f W                 ║\n", maxPower);
+  Serial.printf("║ At Voltage:   %.3f V                 ║\n", maxPowerVoltage);
+  Serial.printf("║ At Current:   %.3f A                 ║\n", maxPowerCurrent);
+  Serial.println("╚═══════════════════════════════════════╝\n");
 }
+
 
 void performAutoMPPT() {
   static float lastPower = 0;
   static int perturbDirection = 1;
   static unsigned long lastMPPTTime = 0;
   
-  if (millis() - lastMPPTTime < 3000) return;
+  if (millis() - lastMPPTTime < 2000) return;
   lastMPPTTime = millis();
   
+  // Perturb & Observe algorithm
   if (power > lastPower) {
-    currentPWM += perturbDirection * 3;
+    currentPWM += perturbDirection * 5;
   } else {
     perturbDirection = -perturbDirection;
-    currentPWM += perturbDirection * 3;
+    currentPWM += perturbDirection * 5;
   }
   
-  if (currentPWM < 0) currentPWM = 0;
-  if (currentPWM > 255) currentPWM = 255;
-  
+  currentPWM = constrain(currentPWM, 0, 255);
   ledcWrite(PWM_PIN, currentPWM);
   lastPower = power;
-  
+
   Serial.print("⚡ Auto MPPT: PWM=");
   Serial.print(currentPWM);
   Serial.print(" (");
@@ -863,6 +1135,15 @@ void performAutoMPPT() {
 
 void setup() {
   Serial.begin(115200);
+
+  ledcAttach(PWM_PIN, PWM_FREQ, PWM_RESOLUTION);
+  ledcWrite(PWM_PIN, 0);
+  Serial.println("✓ MOSFET PWM initialized early on Timer 0");
+
+  // 2. NOW SET UP SERVO RULES
+  // Because Timer 0 is taken, the servo will safely take Timer 1 later
+  myservo.setPeriodHertz(50);
+
   Wire.begin();
 
   Serial.println("Scanning I2C bus...");
@@ -896,25 +1177,22 @@ void setup() {
 
   Serial.println("Stored SSID: " + ssid);
 
-  // ---- Case 1: We have saved credentials ----
+  // ---- Attempt WiFi Connection ----
   if (ssid.length() > 0 && password.length() > 0) {
     Serial.println("Connecting with saved WiFi credentials...");
     connectToWiFi(ssid.c_str(), password.c_str());
-
-    // If connection succeeds, no BLE needed
-    if (wifiConnected) {
-      Serial.println("Connected to WiFi!");
-      pinMode(2, OUTPUT);
-      digitalWrite(2, HIGH);
-      return;
-    }
-
-    Serial.println("Failed to connect with saved WiFi. Starting BLE provisioning...");
   }
 
-  // ---- Case 2: No saved credentials OR connection failed ----
-  startBLEServer();
-  Serial.println("BLE server started. Waiting for WiFi credentials...");
+  // ---- Handle Success or Failure ----
+  if (wifiConnected) {
+    Serial.println("✓ Connected to WiFi!");
+    pinMode(2, OUTPUT);
+    digitalWrite(2, HIGH);
+    // Notice: NO 'return;' here! We just move on to the hardware.
+  } else {
+    Serial.println("⚠ No WiFi connection. Starting BLE provisioning...");
+    startBLEServer();
+  }
 
   if (initINA226()) {
     Serial.println("✓ INA226 initialized successfully\n");
@@ -925,15 +1203,32 @@ void setup() {
       delay(1000);
     }
   }
-    // Initialize PWM - compatible with ESP32 Core 3.x
-  ledcAttach(PWM_PIN, PWM_FREQ, PWM_RESOLUTION);
-  ledcWrite(PWM_PIN, 0);
+
+
+  Serial.println("\n===========================================");
+  Serial.println("SYSTEM READY - Starting MPPT Test");
+  Serial.println("===========================================\n");
+  
+  // delay(2000);
+  
+  // // Run hardware test
+  // // testMOSFET();
   
   lastTime = millis();
   startTime = millis();
 
-  pinMode(2, OUTPUT);
-  digitalWrite(2, HIGH);
+
+  timeClient.begin();
+  timeClient.setTimeOffset(-5 * 3600);
+  timeClient.update(); 
+  
+  // // Optional: Force an update on boot to verify we have time
+  if(wifiConnected) {
+    timeClient.update(); 
+  }
+  
+  // // pinMode(2, OUTPUT);
+  // // digitalWrite(2, HIGH);
 
   Serial.println("✓ System ready! Starting measurements...\n");
 }
